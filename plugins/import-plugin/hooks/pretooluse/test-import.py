@@ -9,14 +9,14 @@ with only __init__.py) BEFORE the real base-plugin/python/lib/ on sys.path.
 Python finds the shadow lib first, which has no config_cache.py, causing the error.
 
 To reproduce the cache bug:
-1. Install with this hook as-is — import fails (shadow path wins)
-2. Remove the lines between --- SHADOW PATH HACK --- and --- END SHADOW PATH HACK ---
-3. Clear plugin cache and refresh
-4. Verify: grep shadow_path in cached hook returns nothing
-5. Observe: does Claude Code still fail with the stale error?
+1. Install with SHADOW_ENABLED = True — import fails (shadow path wins)
+2. Edit the CACHED file: change SHADOW_ENABLED = True to SHADOW_ENABLED = False
+3. Verify: grep SHADOW_ENABLED in cached file shows False
+4. Observe: does Claude Code still fail with the stale error?
 
-If the error persists after step 4 despite verified fix, that's the bug.
+If the error persists after step 2 despite the fix being in the cached file, that's the bug.
 
+Toggle: Change SHADOW_ENABLED below to switch between error/fixed states.
 Log file: ~/.claude/plugins/cache/plugin-import-error/plugin-import-error.log
 """
 import json
@@ -26,6 +26,10 @@ from pathlib import Path
 
 
 LOG_FILE = Path(__file__).resolve().parent.parent.parent.parent.parent / "plugin-import-error.log"
+
+# Toggle this to switch between error state (True) and fixed state (False).
+# Edit the CACHED copy of this file to test cache staleness.
+SHADOW_ENABLED = True
 
 
 def log(msg: str) -> None:
@@ -53,13 +57,14 @@ def _safe_main() -> None:
         sys.path.insert(0, base_path)
     log(f"Base plugin path inserted: {base_path}")
 
-    # --- SHADOW PATH HACK (remove these lines in Step 2 to "fix" the error) ---
-    # Inserted AFTER base_path so shadow lands at sys.path[0] and wins resolution
-    shadow_path = str(Path(_plugins["import-plugin@plugin-import-error"][0]["installPath"]) / "shadow-lib")
-    if shadow_path not in sys.path:
-        sys.path.insert(0, shadow_path)
-    log(f"Shadow path inserted (at position 0, overrides base): {shadow_path}")
-    # --- END SHADOW PATH HACK ---
+    # Shadow path hack: inserts empty lib package ahead of real one
+    if SHADOW_ENABLED:
+        shadow_path = str(Path(_plugins["import-plugin@plugin-import-error"][0]["installPath"]) / "shadow-lib")
+        if shadow_path not in sys.path:
+            sys.path.insert(0, shadow_path)
+        log(f"Shadow ENABLED - inserted at position 0: {shadow_path}")
+    else:
+        log("Shadow DISABLED - using base-plugin path only")
 
     # With shadow hack: fails because shadow-lib/lib/ is found first
     # shadow-lib/lib/ has __init__.py but no config_cache.py
