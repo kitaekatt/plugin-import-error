@@ -1,0 +1,8 @@
+{
+  "name": "import-plugin",
+  "version": "0.1.0",
+  "description": "Plugin that imports from base-plugin",
+  "author": {
+    "name": "Christina"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "plugin-import-error",
+  "description": "Minimal reproduction for plugin import error",
+  "owner": {
+    "name": "kitaekatt"
+  },
+  "plugins": [
+    {
+      "name": "base-plugin",
+      "description": "Base plugin providing importable module",
+      "version": "0.1.0",
+      "author": {"name": "Christina"},
+      "source": "./plugins/base-plugin"
+    },
+    {
+      "name": "import-plugin",
+      "description": "Plugin that imports from base-plugin",
+      "version": "0.1.0",
+      "author": {"name": "Christina"},
+      "source": "./plugins/import-plugin"
+    }
+  ]
+}
