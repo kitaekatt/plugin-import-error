@@ -1,138 +1,98 @@
 #!/usr/bin/env python3
-"""Compare buggy walk-up bootstrap vs fixed registry-based bootstrap.
+"""PreToolUse hook that reproduces the cache staleness bug.
 
-Demonstrates both approaches side-by-side:
-- Walk-up: fragile, silently falls through to / when marker missing
-- Registry: deterministic, reads installed_plugins.json directly
+Uses registry-based bootstrap (installed_plugins.json) for path resolution,
+matching the pattern used by all kitaekatt-plugins hooks.
 
-Fixed in kitaekatt-plugins commit af3e53f.
+This hook has a shadow path hack that inserts shadow-lib/lib/ (empty package
+with only __init__.py) BEFORE the real base-plugin/python/lib/ on sys.path.
+Python finds the shadow lib first, which has no config_cache.py, causing the error.
+
+To reproduce the cache bug:
+1. Install with this hook as-is — import fails (shadow path wins)
+2. Remove the lines between --- SHADOW PATH HACK --- and --- END SHADOW PATH HACK ---
+3. Clear plugin cache and refresh
+4. Verify: grep shadow_path in cached hook returns nothing
+5. Observe: does Claude Code still fail with the stale error?
+
+If the error persists after step 4 despite verified fix, that's the bug.
+
+Log file: ~/.claude/plugins/cache/plugin-import-error/plugin-import-error.log
 """
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 
-def test_walkup_bootstrap() -> dict:
-    """Test the old walk-up pattern from the hook's actual location.
-
-    When running from source (--plugin-dir), .claude-plugin IS in an
-    ancestor, so this succeeds. But when running from a location where
-    the marker is missing, it silently falls through to /.
-    """
-    hook_file = Path(__file__).resolve()
-    plugin_root = hook_file.parent
-    while not (plugin_root / ".claude-plugin").exists() and plugin_root != plugin_root.parent:
-        plugin_root = plugin_root.parent
-
-    python_path = str(plugin_root / "python")
-    fell_through = str(plugin_root) == "/"
-
-    import_ok = False
-    error = None
-    if not fell_through:
-        sys.path.insert(0, python_path)
-        try:
-            from import_plugin_resolver import import_plugin
-            import_plugin("base-plugin@plugin-import-error", "python")
-            from base_module import hello  # noqa: F401
-            import_ok = True
-        except Exception as e:
-            error = f"{type(e).__name__}: {e}"
-        finally:
-            if python_path in sys.path:
-                sys.path.remove(python_path)
-    else:
-        error = "Walk-up fell through to / — would inject /python/ into sys.path"
-
-    return {
-        "method": "walk-up",
-        "plugin_root": str(plugin_root),
-        "fell_through_to_root": fell_through,
-        "import_succeeded": import_ok,
-        "error": error,
-    }
+LOG_FILE = Path(__file__).resolve().parent.parent.parent.parent.parent / "plugin-import-error.log"
 
 
-def test_registry_bootstrap() -> dict:
-    """Test the fixed registry-based pattern.
-
-    Reads installed_plugins.json directly — no filesystem walking.
-    Always works if plugins are installed in the registry.
-    """
-    registry_path = Path.home() / ".claude/plugins/installed_plugins.json"
-
-    if not registry_path.exists():
-        return {
-            "method": "registry",
-            "import_succeeded": False,
-            "error": f"Registry not found: {registry_path}",
-            "note": "Expected when plugin-import-error marketplace not registered",
-        }
-
+def log(msg: str) -> None:
+    """Append timestamped message to log file."""
     try:
-        with open(registry_path) as f:
-            plugins = json.loads(f.read())["plugins"]
-
-        plugin_id = "base-plugin@plugin-import-error"
-        if plugin_id not in plugins:
-            return {
-                "method": "registry",
-                "import_succeeded": False,
-                "error": f"Plugin not in registry: {plugin_id}",
-                "available_plugins": list(plugins.keys())[:5],
-                "note": "Register plugin-import-error marketplace to test this path",
-            }
-
-        install_path = str(Path(plugins[plugin_id][0]["installPath"]) / "python")
-        sys.path.insert(0, install_path)
-        try:
-            from base_module import hello  # noqa: F401
-            return {
-                "method": "registry",
-                "install_path": install_path,
-                "import_succeeded": True,
-                "error": None,
-            }
-        except ImportError as e:
-            return {
-                "method": "registry",
-                "install_path": install_path,
-                "import_succeeded": False,
-                "error": str(e),
-            }
-        finally:
-            if install_path in sys.path:
-                sys.path.remove(install_path)
-
-    except Exception as e:
-        return {
-            "method": "registry",
-            "import_succeeded": False,
-            "error": f"{type(e).__name__}: {e}",
-        }
+        with open(LOG_FILE, "a") as f:
+            f.write(f"[{datetime.now().isoformat()}] {msg}\n")
+    except Exception:
+        pass
 
 
-def main() -> None:
-    """Run both bootstrap methods and compare results."""
-    walkup_result = test_walkup_bootstrap()
-    registry_result = test_registry_bootstrap()
+def _safe_main() -> None:
+    hook_file = Path(__file__).resolve()
+    log(f"Hook invoked from: {hook_file}")
 
-    result = {
+    # Registry-based import: resolve plugin paths from installed_plugins.json.
+    # This works in both source and cache directory layouts.
+    _registry = Path.home() / ".claude/plugins/installed_plugins.json"
+    with open(_registry) as _f:
+        _plugins = json.loads(_f.read())["plugins"]
+
+    # Add base-plugin's python/ to path (the real lib package lives here)
+    base_path = str(Path(_plugins["base-plugin@plugin-import-error"][0]["installPath"]) / "python")
+    if base_path not in sys.path:
+        sys.path.insert(0, base_path)
+    log(f"Base plugin path inserted: {base_path}")
+
+    # --- SHADOW PATH HACK (remove these lines in Step 2 to "fix" the error) ---
+    # Inserted AFTER base_path so shadow lands at sys.path[0] and wins resolution
+    shadow_path = str(Path(_plugins["import-plugin@plugin-import-error"][0]["installPath"]) / "shadow-lib")
+    if shadow_path not in sys.path:
+        sys.path.insert(0, shadow_path)
+    log(f"Shadow path inserted (at position 0, overrides base): {shadow_path}")
+    # --- END SHADOW PATH HACK ---
+
+    # With shadow hack: fails because shadow-lib/lib/ is found first
+    # shadow-lib/lib/ has __init__.py but no config_cache.py
+    # Without shadow hack: should succeed via base-plugin/python/lib/config_cache.py
+    log("Attempting: from lib.config_cache import get_config")
+    from lib.config_cache import get_config
+
+    result = get_config()
+    log(f"SUCCESS: {result}")
+
+    print(json.dumps({
         "continue": True,
-        "message": json.dumps({
-            "test": "walk-up vs registry bootstrap comparison",
-            "walkup": walkup_result,
-            "registry": registry_result,
-            "summary": (
-                "Walk-up works HERE because --plugin-dir provides "
-                ".claude-plugin in ancestors. But it fails when the marker "
-                "is missing (see test-walkup-fallthrough.py). Registry-based "
-                "bootstrap is deterministic regardless of directory structure."
-            ),
-        }, indent=2),
-    }
-    print(json.dumps(result))
+        "suppressOutput": False,
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": f"config loaded: {result}"
+        }
+    }))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        _safe_main()
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        log(f"FAILED: {error_msg}")
+        print(json.dumps({
+            "continue": True,
+            "suppressOutput": False,
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": f"IMPORT ERROR: {error_msg}"
+            }
+        }))

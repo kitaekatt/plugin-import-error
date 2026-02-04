@@ -1,8 +1,5 @@
 {
   "name": "base-plugin",
   "version": "0.1.0",
-  "description": "Base plugin providing importable module",
-  "author": {
-    "name": "Christina"
-  }
+  "description": "Provides lib.config_cache module"
 }

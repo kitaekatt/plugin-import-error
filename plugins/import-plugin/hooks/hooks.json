@@ -6,12 +6,6 @@
         "hooks": [
           {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse/test-import.py"}
         ]
-      },
-      {
-        "matcher": "*",
-        "hooks": [
-          {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse/test-walkup-fallthrough.py"}
-        ]
       }
     ]
   }
