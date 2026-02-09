@@ -29,13 +29,30 @@ def log(msg: str) -> None:
         pass
 
 
+def transcript_stem(payload: dict) -> str | None:
+    tp = payload.get("transcript_path", "")
+    return Path(tp).stem if tp else None
+
+
+def already_logged_for_session(stem: str) -> bool:
+    try:
+        return stem in LOG_FILE.read_text()
+    except Exception:
+        return False
+
+
 def main() -> None:
     try:
-        json.loads(sys.stdin.read())
+        payload = json.loads(sys.stdin.read())
     except Exception:
         sys.exit(0)
 
     pid = os.getpid()
+    stem = transcript_stem(payload)
+
+    # Log once per session to prove the hook is firing
+    if stem and not already_logged_for_session(stem):
+        log(f"ACTIVE session={stem} pid={pid}")
 
     # Check for stale modules BEFORE importing anything
     lib_stale = "lib" in sys.modules
