@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""PreToolUse hook: Passive detection of stale sys.modules across hook invocations.
+"""PreToolUse hook: Always-on passive monitor for stale sys.modules.
 
-Does NOT force a collision. Instead:
-1. Checks if `lib` or `lib.config_cache` is already in sys.modules at startup
-2. If found: reports STALE MODULE DETECTED (proves cross-invocation persistence)
-3. If not found: imports normally from base-plugin and reports success
+Fires on every tool call. Silent unless the bug is detected.
 
-The shadow-lib package exists but is NOT added to sys.path by this hook.
-It's only relevant if Claude Code's runtime leaks it from another hook/invocation.
-
-Only triggers on the "favorite-color" skill invocation.
+On each invocation:
+1. Check if `lib` or `lib.config_cache` is already in sys.modules (stale leak)
+2. Resolve base-plugin path, add to sys.path
+3. Attempt: from lib.config_cache import get_config
+4. Success → silent pass
+5. Failure → deny with "BUG REPRODUCED" + diagnostic state
 
 Related: https://github.com/anthropics/claude-code/issues/23089
 """
@@ -31,77 +30,45 @@ def log(msg: str) -> None:
 
 
 def main() -> None:
-    # Read hook input from stdin
     try:
-        hook_input = json.loads(sys.stdin.read())
+        json.loads(sys.stdin.read())
     except Exception:
         sys.exit(0)
 
-    # Only act on the "favorite-color" skill
-    tool_input = hook_input.get("tool_input", {})
-    skill_name = tool_input.get("skill", "")
-    if skill_name not in ("favorite-color", "import-plugin:favorite-color"):
-        sys.exit(0)
-
     pid = os.getpid()
-    log(f"TEST-IMPORT pid={pid} invoked for skill={skill_name}")
 
-    # === PASSIVE DETECTION ===
-    # Check if lib is already in sys.modules BEFORE we do anything.
-    # In a fresh process, it should NOT be present.
-    # If present, it leaked from a prior hook invocation (the bug).
+    # Check for stale modules BEFORE importing anything
     lib_stale = "lib" in sys.modules
     lib_cc_stale = "lib.config_cache" in sys.modules
-
-    stale_details = ""
-    if lib_stale or lib_cc_stale:
-        lib_mod = sys.modules.get("lib")
-        lib_file = getattr(lib_mod, "__file__", "(none)") if lib_mod else "(none)"
-        lib_path_attr = getattr(lib_mod, "__path__", "(none)") if lib_mod else "(none)"
-        stale_details = f"lib.__file__={lib_file}, lib.__path__={lib_path_attr}"
-        log(f"TEST-IMPORT pid={pid} STALE MODULES AT STARTUP: lib={lib_stale} lib.config_cache={lib_cc_stale} {stale_details}")
-
-    # Log all non-stdlib top-level modules for forensics
-    non_stdlib = [m for m in sorted(sys.modules.keys())
-                  if not m.startswith(('_', 'builtins', 'sys', 'os', 'io',
-                                       'posix', 'encodings', 'codecs', 'abc',
-                                       'importlib', 'types', 'warnings',
-                                       'collections', 'functools', 'operator',
-                                       'keyword', 'signal', 'errno', 'stat',
-                                       'genericpath', 'posixpath', 'nt',
-                                       'zipimport', 'marshal'))
-                  and '.' not in m]
-    log(f"TEST-IMPORT pid={pid} sys.modules at startup: {non_stdlib}")
 
     # Resolve base-plugin path from registry
     registry = Path.home() / ".claude/plugins/installed_plugins.json"
     try:
         with open(registry) as f:
             plugins = json.loads(f.read())["plugins"]
-    except Exception as e:
-        log(f"TEST-IMPORT pid={pid} registry error: {e}")
-        print(json.dumps({"continue": True, "suppressOutput": False}))
-        sys.exit(0)
-
-    # Add ONLY base-plugin's python/ to sys.path (no shadow!)
-    try:
         base_path = str(Path(plugins["base-plugin@plugin-import-error"][0]["installPath"]) / "python")
         if base_path not in sys.path:
             sys.path.insert(0, base_path)
-        log(f"TEST-IMPORT pid={pid} base-plugin path: {base_path}")
-    except (KeyError, IndexError) as e:
-        log(f"TEST-IMPORT pid={pid} base-plugin not found: {e}")
+    except Exception:
+        # Can't resolve base-plugin — silently pass
+        print(json.dumps({"continue": True, "suppressOutput": True}))
+        sys.exit(0)
 
-    # If stale module detected, report it prominently
-    if lib_stale or lib_cc_stale:
+    # Attempt the import
+    try:
+        from lib.config_cache import get_config
+        get_config()
+    except (ModuleNotFoundError, ImportError) as e:
+        lib_mod = sys.modules.get("lib")
+        lib_file = getattr(lib_mod, "__file__", "(none)") if lib_mod else "(not in sys.modules)"
+        lib_path_attr = getattr(lib_mod, "__path__", "(none)") if lib_mod else "(not in sys.modules)"
+
         reason = (
-            f"STALE MODULE DETECTED (github.com/anthropics/claude-code/issues/23089): "
-            f"lib was in sys.modules BEFORE this hook imported anything.\n"
-            f"lib={lib_stale}, lib.config_cache={lib_cc_stale}\n"
-            f"{stale_details}\n"
-            f"pid={pid}"
+            f"BUG REPRODUCED (github.com/anthropics/claude-code/issues/23089): {e}\n"
+            f"lib stale at startup: {lib_stale}, lib.config_cache stale: {lib_cc_stale}\n"
+            f"lib.__file__={lib_file}, lib.__path__={lib_path_attr}, pid={pid}"
         )
-        log(f"TEST-IMPORT pid={pid} REPORTING STALE DETECTION")
+        log(f"pid={pid} {reason}")
 
         print(json.dumps({
             "continue": True,
@@ -114,52 +81,19 @@ def main() -> None:
         }))
         sys.exit(0)
 
-    # Normal import — should always succeed in a fresh process
-    try:
-        from lib.config_cache import get_config
-        result = get_config()
-        source = result.get("source", "unknown")
-        log(f"TEST-IMPORT pid={pid} import ok: source={source}")
-
-        print(json.dumps({
-            "continue": True,
-            "suppressOutput": False,
-            "systemMessage": f"[import-test] pid={pid} import ok, source={source}, no stale modules detected"
-        }))
-
-    except (ModuleNotFoundError, ImportError) as e:
-        # This shouldn't happen without the shadow — if it does, something else is wrong
-        log(f"TEST-IMPORT pid={pid} UNEXPECTED IMPORT FAILURE: {e}")
-
+    # If modules were stale at startup but import succeeded anyway, log it
+    if lib_stale or lib_cc_stale:
         lib_mod = sys.modules.get("lib")
-        lib_file = getattr(lib_mod, "__file__", "(none)") if lib_mod else "(not in sys.modules)"
+        lib_file = getattr(lib_mod, "__file__", "(none)") if lib_mod else "(none)"
+        log(f"pid={pid} STALE AT STARTUP (import succeeded): lib={lib_stale} lib.config_cache={lib_cc_stale} lib.__file__={lib_file}")
 
-        reason = (
-            f"UNEXPECTED IMPORT FAILURE (github.com/anthropics/claude-code/issues/23089): {e}\n"
-            f"No shadow-lib was added to sys.path — this failure is from stale runtime state.\n"
-            f"lib in sys.modules={('lib' in sys.modules)}, lib.__file__={lib_file}\n"
-            f"pid={pid}"
-        )
-
-        print(json.dumps({
-            "continue": True,
-            "suppressOutput": False,
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason
-            }
-        }))
-
-    except Exception as e:
-        log(f"TEST-IMPORT pid={pid} unexpected error: {type(e).__name__}: {e}")
-        print(json.dumps({"continue": True, "suppressOutput": False}))
+    # Success — silent pass
+    print(json.dumps({"continue": True, "suppressOutput": True}))
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log(f"TEST-IMPORT FATAL: {type(e).__name__}: {e}")
-        print(json.dumps({"continue": True, "suppressOutput": False}))
-        sys.exit(0)
+        log(f"pid={os.getpid()} FATAL: {type(e).__name__}: {e}")
+        print(json.dumps({"continue": True, "suppressOutput": True}))
