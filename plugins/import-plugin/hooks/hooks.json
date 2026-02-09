@@ -2,9 +2,18 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "*",
+        "matcher": "Skill",
         "hooks": [
-          {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse/test-import.py"}
+          {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse/test-import.py"},
+          {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse/probe-modules.py"}
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/posttooluse/check-stale-modules.py"}
         ]
       }
     ]

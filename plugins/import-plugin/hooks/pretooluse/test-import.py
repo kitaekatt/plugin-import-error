@@ -1,39 +1,33 @@
 #!/usr/bin/env python3
-"""PreToolUse hook that reproduces the cache staleness bug.
+"""PreToolUse hook: Cross-plugin import collision reproduction.
 
-Uses registry-based bootstrap (installed_plugins.json) for path resolution,
-matching the pattern used by all kitaekatt-plugins hooks.
+Tests whether Claude Code's hook execution shares sys.modules across
+plugin hooks, causing namespace collisions.
 
-This hook has a shadow path hack that inserts shadow-lib/lib/ (empty package
-with only __init__.py) BEFORE the real base-plugin/python/lib/ on sys.path.
-Python finds the shadow lib first, which has no config_cache.py, causing the error.
+Setup:
+- base-plugin provides: python/lib/config_cache.py (the real module)
+- import-plugin provides: shadow-lib/lib/__init__.py (shadow package, no config_cache)
 
-To reproduce the cache bug:
-1. Install with SHADOW_ENABLED = True — import fails (shadow path wins)
-2. Edit the CACHED file: change SHADOW_ENABLED = True to SHADOW_ENABLED = False
-3. Verify: grep SHADOW_ENABLED in cached file shows False
-4. Observe: does Claude Code still fail with the stale error?
+This hook adds both to sys.path (shadow first), then attempts:
+    from lib.config_cache import get_config
 
-If the error persists after step 2 despite the fix being in the cached file, that's the bug.
+If sys.modules is shared across hooks, a prior hook's `lib` import may
+shadow the real one, causing ModuleNotFoundError.
 
-Toggle: Change SHADOW_ENABLED below to switch between error/fixed states.
-Log file: ~/.claude/plugins/cache/plugin-import-error/plugin-import-error.log
+Only triggers on the "favorite-color" skill invocation.
+
+Related: https://github.com/anthropics/claude-code/issues/23089
 """
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
-
 LOG_FILE = Path(__file__).resolve().parent.parent.parent.parent.parent / "plugin-import-error.log"
-
-# Toggle this to switch between error state (True) and fixed state (False).
-# Edit the CACHED copy of this file to test cache staleness.
-SHADOW_ENABLED = True
 
 
 def log(msg: str) -> None:
-    """Append timestamped message to log file."""
     try:
         with open(LOG_FILE, "a") as f:
             f.write(f"[{datetime.now().isoformat()}] {msg}\n")
@@ -41,63 +35,107 @@ def log(msg: str) -> None:
         pass
 
 
-def _safe_main() -> None:
-    hook_file = Path(__file__).resolve()
-    log(f"Hook invoked from: {hook_file}")
+def main() -> None:
+    # Read hook input from stdin
+    try:
+        hook_input = json.loads(sys.stdin.read())
+    except Exception:
+        sys.exit(0)
 
-    # Registry-based import: resolve plugin paths from installed_plugins.json.
-    # This works in both source and cache directory layouts.
-    _registry = Path.home() / ".claude/plugins/installed_plugins.json"
-    with open(_registry) as _f:
-        _plugins = json.loads(_f.read())["plugins"]
+    # Only act on the "favorite-color" skill
+    tool_input = hook_input.get("tool_input", {})
+    skill_name = tool_input.get("skill", "")
+    if skill_name not in ("favorite-color", "import-plugin:favorite-color"):
+        sys.exit(0)
 
-    # Add base-plugin's python/ to path (the real lib package lives here)
-    base_path = str(Path(_plugins["base-plugin@plugin-import-error"][0]["installPath"]) / "python")
-    if base_path not in sys.path:
-        sys.path.insert(0, base_path)
-    log(f"Base plugin path inserted: {base_path}")
+    pid = os.getpid()
+    log(f"TEST-IMPORT pid={pid} invoked for skill={skill_name}")
 
-    # Shadow path hack: inserts empty lib package ahead of real one
-    if SHADOW_ENABLED:
-        shadow_path = str(Path(_plugins["import-plugin@plugin-import-error"][0]["installPath"]) / "shadow-lib")
+    # Check if lib is already in sys.modules (stale from prior invocation)
+    lib_already_cached = "lib" in sys.modules
+    lib_cc_already_cached = "lib.config_cache" in sys.modules
+    if lib_already_cached or lib_cc_already_cached:
+        log(f"TEST-IMPORT pid={pid} STALE: lib={lib_already_cached} lib.config_cache={lib_cc_already_cached}")
+
+    # Resolve plugin paths from installed_plugins.json registry
+    registry = Path.home() / ".claude/plugins/installed_plugins.json"
+    try:
+        with open(registry) as f:
+            plugins = json.loads(f.read())["plugins"]
+    except Exception as e:
+        log(f"TEST-IMPORT pid={pid} registry error: {e}")
+        # Can't resolve paths — allow and exit
+        print(json.dumps({"continue": True, "suppressOutput": False}))
+        sys.exit(0)
+
+    # Add base-plugin's python/ to sys.path (provides real lib.config_cache)
+    try:
+        base_path = str(Path(plugins["base-plugin@plugin-import-error"][0]["installPath"]) / "python")
+        if base_path not in sys.path:
+            sys.path.insert(0, base_path)
+        log(f"TEST-IMPORT pid={pid} base-plugin path: {base_path}")
+    except (KeyError, IndexError) as e:
+        log(f"TEST-IMPORT pid={pid} base-plugin not found: {e}")
+
+    # Add import-plugin's shadow-lib/ to sys.path at position 0 (shadows real lib)
+    try:
+        shadow_path = str(Path(plugins["import-plugin@plugin-import-error"][0]["installPath"]) / "shadow-lib")
         if shadow_path not in sys.path:
             sys.path.insert(0, shadow_path)
-        log(f"Shadow ENABLED - inserted at position 0: {shadow_path}")
-    else:
-        log("Shadow DISABLED - using base-plugin path only")
+        log(f"TEST-IMPORT pid={pid} shadow path (pos 0): {shadow_path}")
+    except (KeyError, IndexError) as e:
+        log(f"TEST-IMPORT pid={pid} shadow path not found: {e}")
 
-    # With shadow hack: fails because shadow-lib/lib/ is found first
-    # shadow-lib/lib/ has __init__.py but no config_cache.py
-    # Without shadow hack: should succeed via base-plugin/python/lib/config_cache.py
-    log("Attempting: from lib.config_cache import get_config")
-    from lib.config_cache import get_config
+    log(f"TEST-IMPORT pid={pid} sys.path order: {sys.path[:5]}")
 
-    result = get_config()
-    log(f"SUCCESS: {result}")
-
-    print(json.dumps({
-        "continue": True,
-        "suppressOutput": False,
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "permissionDecisionReason": f"config loaded: {result}"
-        }
-    }))
-
-
-if __name__ == "__main__":
+    # Attempt the cross-plugin import
     try:
-        _safe_main()
-    except Exception as e:
-        error_msg = f"{type(e).__name__}: {e}"
-        log(f"FAILED: {error_msg}")
+        from lib.config_cache import get_config
+        result = get_config()
+        source = result.get("source", "unknown")
+        log(f"TEST-IMPORT pid={pid} SUCCESS: source={source}")
+
+        # Import succeeded — report and allow
+        print(json.dumps({
+            "continue": True,
+            "suppressOutput": False,
+            "systemMessage": f"[import-test] import succeeded: source={source} (no collision this invocation)"
+        }))
+
+    except (ModuleNotFoundError, ImportError) as e:
+        log(f"TEST-IMPORT pid={pid} BUG REPRODUCED: {e}")
+
+        # Bug reproduced — deny with visible error message
+        lib_mod = sys.modules.get("lib")
+        lib_file = getattr(lib_mod, "__file__", "(none)") if lib_mod else "(not in sys.modules)"
+        lib_path_attr = getattr(lib_mod, "__path__", "(none)") if lib_mod else "(not in sys.modules)"
+
+        reason = (
+            f"BUG REPRODUCED (github.com/anthropics/claude-code/issues/23089): {e}\n"
+            f"Shadow lib package overrode real lib via sys.path ordering.\n"
+            f"lib.__file__={lib_file}, lib.__path__={lib_path_attr}\n"
+            f"pid={pid}, stale_before_import={lib_already_cached}"
+        )
+
         print(json.dumps({
             "continue": True,
             "suppressOutput": False,
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-                "permissionDecisionReason": f"IMPORT ERROR: {error_msg}"
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason
             }
         }))
+
+    except Exception as e:
+        log(f"TEST-IMPORT pid={pid} unexpected error: {type(e).__name__}: {e}")
+        print(json.dumps({"continue": True, "suppressOutput": False}))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        log(f"TEST-IMPORT FATAL: {type(e).__name__}: {e}")
+        print(json.dumps({"continue": True, "suppressOutput": False}))
+        sys.exit(0)
